@@ -129,6 +129,50 @@ def load_model_pair(model_name: str, correct_path: Path, mis_path: Path) -> pd.D
     return pd.concat([correct_df, mis_df], ignore_index=True)
 
 
+def apply_comparison_mode(
+    df: pd.DataFrame,
+    compared_models: list[str],
+    comparison_mode: str,
+    intersection_classification: str | None,
+) -> pd.DataFrame:
+    """Filter by file_name based on correctness agreement across compared models.
+
+    Notes:
+    - Operates on the pre-filtered (per-model) table so we don't break agreement math.
+    - Returns per-model rows for the retained file_names (not an aggregated table).
+    """
+
+    if "model" not in df.columns or "classification" not in df.columns or "file_name" not in df.columns:
+        return df
+
+    if len(compared_models) < 2:
+        return df[df["model"].isin(compared_models)] if compared_models else df
+
+    scoped = df[df["model"].isin(compared_models)]
+    if comparison_mode == "Union":
+        return scoped
+
+    if comparison_mode == "Intersection":
+        if not intersection_classification:
+            return scoped.iloc[0:0]
+        in_class = scoped[scoped["classification"] == intersection_classification]
+        keep_files = in_class.groupby("file_name")["model"].nunique()
+        keep_files = keep_files[keep_files == len(compared_models)].index
+        return scoped[scoped["file_name"].isin(keep_files)]
+
+    if comparison_mode == "Disagreement":
+        per_file = scoped.groupby("file_name").agg(
+            model_count=("model", "nunique"),
+            class_count=("classification", "nunique"),
+        )
+        keep_files = per_file[
+            (per_file["model_count"] == len(compared_models)) & (per_file["class_count"] > 1)
+        ].index
+        return scoped[scoped["file_name"].isin(keep_files)]
+
+    return scoped
+
+
 def load_image(path: Path, max_width: int | None) -> Image.Image | None:
     if not path.exists():
         return None
@@ -209,6 +253,19 @@ pred_options = unique_options(combined, "predicted_word_label")
 
 with st.sidebar:
     models_filter = st.multiselect("Model", model_options, default=model_options) if model_options else []
+    compared_models = models_filter if models_filter else model_options
+    multi_model = len(compared_models) >= 2
+    comparison_mode = "Union"
+    if multi_model:
+        comparison_mode = st.selectbox(
+            "Comparison mode",
+            ["Union", "Intersection", "Disagreement"],
+            help=(
+                "Union shows all rows from the compared models. "
+                "Intersection keeps samples where all compared models share the selected correctness. "
+                "Disagreement keeps samples where models differ on correct vs mis."
+            ),
+        )
     classifications = st.multiselect("Classification", classification_options, default=classification_options)
     datasets = st.multiselect("Dataset", dataset_options, default=dataset_options)
     gt_labels = st.multiselect("Ground truth label", gt_options, default=[])
@@ -225,8 +282,19 @@ with st.sidebar:
     top3_precision = st.slider("Top-3 prob decimals", min_value=2, max_value=5, value=3)
     show_table = st.checkbox("Show filtered table", value=False)
 
-filtered = apply_filters(
+if multi_model and comparison_mode == "Intersection" and len(classifications) != 1:
+    st.info("Intersection mode requires selecting exactly one Classification (correct or mis).")
+    st.stop()
+
+comparison_df = apply_comparison_mode(
     combined,
+    compared_models,
+    comparison_mode,
+    classifications[0] if comparison_mode == "Intersection" and len(classifications) == 1 else None,
+)
+
+filtered = apply_filters(
+    comparison_df,
     models_filter,
     classifications,
     datasets,
@@ -238,13 +306,15 @@ filtered = apply_filters(
 if sort_by in filtered.columns:
     filtered = filtered.sort_values(sort_by, ascending=sort_ascending, na_position="last")
 
+sample_count = int(filtered["file_name"].nunique()) if "file_name" in filtered.columns else len(filtered)
 count_correct = int((filtered["classification"] == "correct").sum())
 count_mis = int((filtered["classification"] == "mis").sum())
 
-metrics_cols = st.columns(3)
-metrics_cols[0].metric("Filtered total", len(filtered))
-metrics_cols[1].metric("Correct", count_correct)
-metrics_cols[2].metric("Misclassified", count_mis)
+metrics_cols = st.columns(4)
+metrics_cols[0].metric("Filtered samples", sample_count)
+metrics_cols[1].metric("Filtered rows", len(filtered))
+metrics_cols[2].metric("Correct rows", count_correct)
+metrics_cols[3].metric("Mis rows", count_mis)
 
 if filtered.empty:
     st.info("No samples match the current filters.")
