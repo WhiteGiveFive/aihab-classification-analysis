@@ -16,6 +16,29 @@ DEFAULT_MODEL_MIS = "mis.csv"
 DEFAULT_CORRECT_CSV = APP_DIR / "correctly_classified_samples_test.csv"
 DEFAULT_MIS_CSV = APP_DIR / "misclassified_samples_test.csv"
 
+NAME_LABEL = {
+    "Urban": 0,
+    "Broadleaved Mixed and Yew Woodland": 1,
+    "Coniferous Woodland": 2,
+    "Sea": 3,
+    "Arable and Horticulture": 4,
+    "Improved Grassland": 5,
+    "Neutral Grassland": 6,
+    "Calcareous Grassland": 7,
+    "Acid Grassland": 8,
+    "Bracken": 9,
+    "Dwarf Shrub Heath": 10,
+    "Fen, Marsh, Swamp": 11,
+    "Bog": 12,
+    "Littoral Rock": 13,
+    "Littoral Sediment": 14,
+    "Montane": 15,
+    "Standing Open Waters and Canals": 16,
+    "Inland Rock": 17,
+    "Supra-littoral Rock": 18,
+    "Supra-littoral Sediment": 19,
+}
+
 st.set_page_config(page_title="AIHAB Classification Gallery", layout="wide")
 
 
@@ -186,6 +209,10 @@ def load_image(path: Path, max_width: int | None) -> Image.Image | None:
         return None
 
 
+def cam_filename(file_name: str, prefix: str) -> str:
+    return f"{prefix}{Path(file_name).name}"
+
+
 st.title("AIHAB Classification Gallery")
 st.caption("Local, self-hosted viewer for correct vs misclassified samples.")
 
@@ -239,6 +266,11 @@ else:
     mis_df = load_csv(str(mis_csv), "mis", mis_csv.stat().st_mtime)
     combined = pd.concat([correct_df, mis_df], ignore_index=True)
 
+default_cam_dir = dataset_dir.parent / f"{dataset_dir.name}_cams"
+fallback_cam_dir = APP_DIR / "CS_Xplots_2019_2023_test_cams"
+if not default_cam_dir.exists() and fallback_cam_dir.exists():
+    default_cam_dir = fallback_cam_dir
+
 if "file_name" not in combined.columns:
     st.error("CSV missing required 'file_name' column.")
     st.stop()
@@ -278,9 +310,21 @@ with st.sidebar:
     page_size = st.selectbox("Images per page", [24, 48, 96, 120], index=0)
     columns = st.slider("Gallery columns", min_value=2, max_value=6, value=4)
     max_width = st.slider("Max image width (px)", min_value=256, max_value=1024, value=512, step=64)
+    cam_mode = st.selectbox(
+        "CAM view",
+        ["Off", "Original + CAM (stacked)", "Original + CAM (side-by-side)", "CAM only"],
+        index=0,
+    )
+    cam_dir = Path(st.text_input("CAM folder", str(default_cam_dir))).expanduser()
+    cam_prefix = st.text_input("CAM filename prefix", "cam_")
     show_top3 = st.checkbox("Show top-3 predictions in caption", value=True)
     top3_precision = st.slider("Top-3 prob decimals", min_value=2, max_value=5, value=3)
     show_table = st.checkbox("Show filtered table", value=False)
+
+    with st.expander("Label mapping", expanded=False):
+        label_map = sorted([(label, name) for name, label in NAME_LABEL.items()], key=lambda x: x[0])
+        label_df = pd.DataFrame(label_map, columns=["Label", "Name"])
+        st.dataframe(label_df, use_container_width=True, hide_index=True)
 
 if multi_model and comparison_mode == "Intersection" and len(classifications) != 1:
     st.info("Intersection mode requires selecting exactly one Classification (correct or mis).")
@@ -328,21 +372,81 @@ page_df = filtered.iloc[start:end]
 
 st.write(f"Showing {start + 1}-{min(end, len(filtered))} of {len(filtered)}")
 
+cam_enabled = cam_mode != "Off"
+cam_dir_exists = cam_dir.exists()
+if cam_enabled and not cam_dir_exists:
+    st.warning(f"CAM folder not found: {cam_dir}")
+    if cam_mode == "CAM only":
+        st.stop()
+
 rows = list(page_df.iterrows())
 columns_list = st.columns(columns)
 
 for idx, (_, row) in enumerate(rows):
     col = columns_list[idx % columns]
-    img_path = dataset_dir / row["file_name"]
-    image = load_image(img_path, max_width)
-    if image is None:
-        col.warning(f"Missing: {row['file_name']}")
+    file_name = str(row["file_name"])
+    img_path = dataset_dir / file_name
+    orig_image = None
+    if cam_mode != "CAM only":
+        orig_image = load_image(img_path, max_width)
+        if orig_image is None and cam_mode == "Off":
+            col.warning(f"Missing: {file_name}")
+            continue
+
+    cam_image = None
+    cam_file = cam_filename(file_name, cam_prefix)
+    if cam_enabled and cam_dir_exists:
+        cam_image = load_image(cam_dir / cam_file, max_width)
+
+    if cam_mode == "Off":
+        col.image(
+            orig_image,
+            caption=build_caption(row, show_top3, top3_precision),
+            use_container_width=True,
+        )
         continue
-    col.image(
-        image,
-        caption=build_caption(row, show_top3, top3_precision),
-        use_container_width=True,
-    )
+
+    if cam_mode == "CAM only":
+        if cam_image is None:
+            col.caption(f"CAM missing: {cam_file}")
+            continue
+        col.image(
+            cam_image,
+            caption=build_caption(row, show_top3, top3_precision),
+            use_container_width=True,
+        )
+        continue
+
+    if cam_mode == "Original + CAM (side-by-side)":
+        left, right = col.columns(2)
+        if orig_image is None:
+            left.warning(f"Missing: {file_name}")
+        else:
+            left.image(
+                orig_image,
+                caption=build_caption(row, show_top3, top3_precision),
+                use_container_width=True,
+            )
+        if cam_image is None:
+            if cam_dir_exists:
+                right.caption(f"CAM missing: {cam_file}")
+        else:
+            right.image(cam_image, caption="CAM", use_container_width=True)
+        continue
+
+    if orig_image is None:
+        col.warning(f"Missing: {file_name}")
+    else:
+        col.image(
+            orig_image,
+            caption=build_caption(row, show_top3, top3_precision),
+            use_container_width=True,
+        )
+    if cam_image is None:
+        if cam_dir_exists:
+            col.caption(f"CAM missing: {cam_file}")
+    else:
+        col.image(cam_image, caption="CAM", use_container_width=True)
 
 if show_table:
     st.dataframe(page_df, use_container_width=True)
