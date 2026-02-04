@@ -1,5 +1,7 @@
 # Repository Guidelines
 
+This project implements tools that analyse and visualise habitat data.
+
 ## Project Structure & Module Organization
 - `CS_Xplots_2019_2023_test/` holds the primary dataset (JPEG images, two CSVs, and a `.ipynb_checkpoints/` directory).
 - The repository currently has no source-code or test directories; contributions are primarily data updates.

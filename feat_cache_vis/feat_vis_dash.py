@@ -9,8 +9,9 @@ Usage example:
     --port 8050
 """
 
-from pathlib import Path
 import argparse
+import json
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -44,6 +45,18 @@ def build_argparser() -> argparse.ArgumentParser:
         type=str,
         default="",
         help="Local directory to serve images from at /images (uses file_name).",
+    )
+    parser.add_argument(
+        "--mis_csv",
+        type=str,
+        default="mis_Qwen_Qwen3-VL-4B-Instruct.csv",
+        help="Misclassified CSV with rationale JSON (relative to cache_dir).",
+    )
+    parser.add_argument(
+        "--correct_csv",
+        type=str,
+        default="correct_Qwen_Qwen3-VL-4B-Instruct.csv",
+        help="Correct CSV with rationale JSON (relative to cache_dir).",
     )
     parser.add_argument(
         "--color_by",
@@ -92,6 +105,45 @@ def load_data(cache_dir: str, coords_file: str) -> pd.DataFrame:
     return df
 
 
+def _resolve_csv_path(cache_dir: str, csv_path: str) -> Path | None:
+    if not csv_path:
+        return None
+    path = Path(csv_path)
+    if not path.is_absolute():
+        path = Path(cache_dir) / csv_path
+    return path
+
+
+def load_rationale_map(csv_path: Path) -> dict[str, dict[str, object]]:
+    df = pd.read_csv(csv_path)
+    if "file_name" not in df.columns or "rationale" not in df.columns:
+        print(f"[warn] {csv_path.name} missing file_name or rationale; skipping.")
+        return {}
+
+    mapping: dict[str, dict[str, object]] = {}
+    bad = 0
+    for row in df.itertuples(index=False):
+        fname = getattr(row, "file_name", None)
+        raw = getattr(row, "rationale", None)
+        if not isinstance(fname, str) or not isinstance(raw, str):
+            continue
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            bad += 1
+            continue
+        if isinstance(obj, dict):
+            mapping[fname] = {
+                "score": obj.get("score", ""),
+                "rationale": obj.get("rationale", ""),
+            }
+        else:
+            bad += 1
+    if bad:
+        print(f"[warn] {bad} rationale rows in {csv_path.name} could not be parsed.")
+    return mapping
+
+
 def main() -> None:
     args = build_argparser().parse_args()
     df = load_data(args.cache_dir, args.coords_file)
@@ -109,6 +161,20 @@ def main() -> None:
             image_root_url = "/images"
     elif args.image_root:
         image_root_url = args.image_root
+
+    mis_map: dict[str, dict[str, object]] = {}
+    correct_map: dict[str, dict[str, object]] = {}
+    mis_path = _resolve_csv_path(args.cache_dir, args.mis_csv)
+    if mis_path and mis_path.is_file():
+        mis_map = load_rationale_map(mis_path)
+    elif args.mis_csv:
+        print(f"[warn] mis_csv '{mis_path}' not found; skipping.")
+
+    correct_path = _resolve_csv_path(args.cache_dir, args.correct_csv)
+    if correct_path and correct_path.is_file():
+        correct_map = load_rationale_map(correct_path)
+    elif args.correct_csv:
+        print(f"[warn] correct_csv '{correct_path}' not found; skipping.")
 
     hover_cols = [c.strip() for c in str(args.hover).split(",") if c.strip()]
     hover_cols = [c for c in hover_cols if c in df.columns]
@@ -134,7 +200,7 @@ def main() -> None:
         y="y",
         color=color_col,
         hover_data=hover_cols,
-        custom_data=["img_url", "file_name"],
+        custom_data=["img_url", "file_name", "ground_truth_word_label"],
         title="Embedding Viewer",
     )
     fig.update_traces(marker=dict(size=6, opacity=0.8))
@@ -176,7 +242,55 @@ def main() -> None:
         custom = click_data["points"][0].get("customdata", [])
         img_url = custom[0] if len(custom) > 0 else ""
         fname = custom[1] if len(custom) > 1 else ""
-        return img_url, fname
+        gt_word = custom[2] if len(custom) > 2 else ""
+        mis_entry = mis_map.get(fname)
+        correct_entry = correct_map.get(fname)
+        if mis_entry and correct_entry:
+            prediction = "ambiguous (found in mis + correct)"
+            entry = mis_entry
+        elif mis_entry:
+            prediction = "misclassification"
+            entry = mis_entry
+        elif correct_entry:
+            prediction = "correct classification"
+            entry = correct_entry
+        else:
+            prediction = "unknown (not found)"
+            entry = None
+
+        def _format_entry(entry: dict[str, object] | None):
+            if entry is None:
+                return [
+                    html.Div("LLM score: (not found)"),
+                    html.Div("LLM rationale: (not found)"),
+                ]
+            score = entry.get("score", "")
+            rationale = entry.get("rationale", "")
+            return [
+                html.Div(
+                    f"LLM score: {score}"
+                    if score != ""
+                    else "LLM score: (missing)"
+                ),
+                html.Div(
+                    f"LLM rationale: {rationale}"
+                    if rationale != ""
+                    else "LLM rationale: (missing)",
+                    style={"whiteSpace": "pre-wrap"},
+                ),
+            ]
+
+        caption = [
+            html.Div(f"file_name: {fname}" if fname else "file_name: (missing)"),
+            html.Div(
+                f"ground_truth_word_label: {gt_word}"
+                if gt_word != ""
+                else "ground_truth_word_label: (missing)"
+            ),
+            html.Div(f"prediction: {prediction}"),
+            *_format_entry(entry),
+        ]
+        return img_url, caption
 
     print(f"[dash] running on http://{args.host}:{args.port}")
     app.run(host=args.host, port=args.port, debug=False)
