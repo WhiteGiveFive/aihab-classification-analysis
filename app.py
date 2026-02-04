@@ -324,7 +324,7 @@ with st.sidebar:
     with st.expander("Label mapping", expanded=False):
         label_map = sorted([(label, name) for name, label in NAME_LABEL.items()], key=lambda x: x[0])
         label_df = pd.DataFrame(label_map, columns=["Label", "Name"])
-        st.dataframe(label_df, use_container_width=True, hide_index=True)
+        st.dataframe(label_df, width='stretch', hide_index=True)
 
 if multi_model and comparison_mode == "Intersection" and len(classifications) != 1:
     st.info("Intersection mode requires selecting exactly one Classification (correct or mis).")
@@ -402,7 +402,7 @@ for idx, (_, row) in enumerate(rows):
         col.image(
             orig_image,
             caption=build_caption(row, show_top3, top3_precision),
-            use_container_width=True,
+            width='stretch',
         )
         continue
 
@@ -413,7 +413,7 @@ for idx, (_, row) in enumerate(rows):
         col.image(
             cam_image,
             caption=build_caption(row, show_top3, top3_precision),
-            use_container_width=True,
+            width='stretch',
         )
         continue
 
@@ -425,13 +425,13 @@ for idx, (_, row) in enumerate(rows):
             left.image(
                 orig_image,
                 caption=build_caption(row, show_top3, top3_precision),
-                use_container_width=True,
+                use_container_width='stretch',
             )
         if cam_image is None:
             if cam_dir_exists:
                 right.caption(f"CAM missing: {cam_file}")
         else:
-            right.image(cam_image, caption="CAM", use_container_width=True)
+            right.image(cam_image, caption="CAM", width='stretch')
         continue
 
     if orig_image is None:
@@ -440,13 +440,13 @@ for idx, (_, row) in enumerate(rows):
         col.image(
             orig_image,
             caption=build_caption(row, show_top3, top3_precision),
-            use_container_width=True,
+            width='stretch',
         )
     if cam_image is None:
         if cam_dir_exists:
             col.caption(f"CAM missing: {cam_file}")
     else:
-        col.image(cam_image, caption="CAM", use_container_width=True)
+        col.image(cam_image, caption="CAM", width='stretch')
 
 if show_table:
-    st.dataframe(page_df, use_container_width=True)
+    st.dataframe(page_df, width='stretch')
