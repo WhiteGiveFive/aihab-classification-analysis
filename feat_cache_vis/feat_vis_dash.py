@@ -16,6 +16,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 from dash import Dash, dcc, html, Input, Output
 from flask import send_from_directory
 
@@ -57,6 +58,12 @@ def build_argparser() -> argparse.ArgumentParser:
         type=str,
         default="correct_Qwen_Qwen3-VL-4B-Instruct.csv",
         help="Correct CSV with rationale JSON (relative to cache_dir).",
+    )
+    parser.add_argument(
+        "--centroid_csv",
+        type=str,
+        default="scores_centroid.csv",
+        help="Centroid score CSV with outlier metrics (relative to cache_dir).",
     )
     parser.add_argument(
         "--color_by",
@@ -144,6 +151,16 @@ def load_rationale_map(csv_path: Path) -> dict[str, dict[str, object]]:
     return mapping
 
 
+def load_centroid_scores(csv_path: Path) -> pd.DataFrame:
+    df = pd.read_csv(csv_path)
+    required = {"file_name", "sim_to_centroid", "pct_rank_in_class", "is_bottom_5pct"}
+    missing = required - set(df.columns)
+    if missing:
+        print(f"[warn] {csv_path.name} missing columns: {sorted(missing)}; skipping.")
+        return pd.DataFrame(columns=["file_name", "sim_to_centroid", "pct_rank_in_class", "is_bottom_5pct"])
+    return df[list(required)]
+
+
 def main() -> None:
     args = build_argparser().parse_args()
     df = load_data(args.cache_dir, args.coords_file)
@@ -176,6 +193,14 @@ def main() -> None:
     elif args.correct_csv:
         print(f"[warn] correct_csv '{correct_path}' not found; skipping.")
 
+    centroid_path = _resolve_csv_path(args.cache_dir, args.centroid_csv)
+    if centroid_path and centroid_path.is_file():
+        centroid_df = load_centroid_scores(centroid_path)
+        if not centroid_df.empty:
+            df = df.merge(centroid_df, on="file_name", how="left")
+    elif args.centroid_csv:
+        print(f"[warn] centroid_csv '{centroid_path}' not found; skipping.")
+
     hover_cols = [c.strip() for c in str(args.hover).split(",") if c.strip()]
     hover_cols = [c for c in hover_cols if c in df.columns]
     if not hover_cols:
@@ -194,16 +219,50 @@ def main() -> None:
     else:
         df["img_url"] = ""
 
+    custom_cols = [
+        "img_url",
+        "file_name",
+        "ground_truth_word_label",
+        "sim_to_centroid",
+        "pct_rank_in_class",
+        "is_bottom_5pct",
+    ]
+    for col in custom_cols:
+        if col not in df.columns:
+            df[col] = False if col == "is_bottom_5pct" else np.nan
+
     fig = px.scatter(
         df,
         x="x",
         y="y",
         color=color_col,
         hover_data=hover_cols,
-        custom_data=["img_url", "file_name", "ground_truth_word_label"],
+        custom_data=custom_cols,
         title="Embedding Viewer",
     )
     fig.update_traces(marker=dict(size=6, opacity=0.8))
+
+    if "is_bottom_5pct" in df.columns:
+        bottom_mask = df["is_bottom_5pct"] == True
+        df_bottom = df[bottom_mask]
+        if not df_bottom.empty:
+            fig.add_trace(
+                go.Scattergl(
+                    x=df_bottom["x"],
+                    y=df_bottom["y"],
+                    mode="markers",
+                    name="Bottom 5% (centroid)",
+                    marker=dict(
+                        size=10,
+                        symbol="circle-open",
+                        # For open symbols, Plotly uses marker.color for the outline.
+                        color="#FF5500",
+                    ),
+                    customdata=df_bottom[custom_cols].to_numpy(),
+                    hoverinfo="skip",
+                    showlegend=True,
+                )
+            )
 
     app = Dash(__name__)
     if image_dir:
@@ -243,6 +302,8 @@ def main() -> None:
         img_url = custom[0] if len(custom) > 0 else ""
         fname = custom[1] if len(custom) > 1 else ""
         gt_word = custom[2] if len(custom) > 2 else ""
+        sim_to_centroid = custom[3] if len(custom) > 3 else None
+        pct_rank = custom[4] if len(custom) > 4 else None
         mis_entry = mis_map.get(fname)
         correct_entry = correct_map.get(fname)
         if mis_entry and correct_entry:
@@ -280,6 +341,28 @@ def main() -> None:
                 ),
             ]
 
+        def _fmt_num(val, digits: int = 6) -> str:
+            if val is None:
+                return "(missing)"
+            try:
+                if pd.isna(val):
+                    return "(missing)"
+            except Exception:
+                pass
+            if isinstance(val, (int, np.integer)):
+                return str(val)
+            if isinstance(val, (float, np.floating)):
+                return f"{val:.{digits}f}"
+            return str(val)
+
+        pct_rank_str = _fmt_num(pct_rank, digits=6)
+        if pct_rank_str not in ("(missing)",):
+            try:
+                pct_val = float(pct_rank)
+                pct_rank_str = f"{pct_rank_str} ({pct_val * 100:.3f}%)"
+            except Exception:
+                pass
+
         caption = [
             html.Div(f"file_name: {fname}" if fname else "file_name: (missing)"),
             html.Div(
@@ -289,6 +372,8 @@ def main() -> None:
             ),
             html.Div(f"prediction: {prediction}"),
             *_format_entry(entry),
+            html.Div(f"sim_to_centroid: {_fmt_num(sim_to_centroid, digits=6)}"),
+            html.Div(f"pct_rank_in_class: {pct_rank_str}"),
         ]
         return img_url, caption
 

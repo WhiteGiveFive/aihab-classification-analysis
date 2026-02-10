@@ -53,6 +53,16 @@ You can override them:
 --mis_csv your_mis.csv --correct_csv your_correct.csv
 ```
 
+## Centroid Outlier Inputs
+If `scores_centroid.csv` is present in the cache directory, the app:
+- Highlights `is_bottom_5pct = True` points on the plot.
+- Shows `sim_to_centroid` and `pct_rank_in_class` in the image panel.
+
+Override the default path (relative to `--cache_dir`) with:
+```bash
+--centroid_csv your_scores_centroid.csv
+```
+
 ## Other Options
 - `--color_by` (default: `ground_truth_word_label`)
 - `--hover` (default: `file_name,ground_truth_word_label,ground_truth_num_label`)
