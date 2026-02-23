@@ -17,8 +17,64 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from dash import Dash, dcc, html, Input, Output
+from dash import Dash, Input, Output, dcc, html
 from flask import send_from_directory
+
+THRESHOLD_STEPS = [5, 10, 15, 20]
+DEFAULT_METHODS = ["centroid", "multiprototype"]
+
+SCORE_SOURCE_SPECS = [
+    {
+        "key": "centroid_5",
+        "label": "Centroid 5%",
+        "method": "centroid",
+        "threshold": 5,
+        "arg": "centroid_csv",
+        "bottom_col": "is_bottom_5pct",
+    },
+    {
+        "key": "mp_5",
+        "label": "Multiprototype 5%",
+        "method": "multiprototype",
+        "threshold": 5,
+        "arg": "multiprototype_5pct_csv",
+        "bottom_col": "is_bottom_5pct",
+    },
+    {
+        "key": "mp_10",
+        "label": "Multiprototype 10%",
+        "method": "multiprototype",
+        "threshold": 10,
+        "arg": "multiprototype_10pct_csv",
+        "bottom_col": "is_bottom_10pct",
+    },
+    {
+        "key": "mp_15",
+        "label": "Multiprototype 15%",
+        "method": "multiprototype",
+        "threshold": 15,
+        "arg": "multiprototype_15pct_csv",
+        "bottom_col": "is_bottom_15pct",
+    },
+    {
+        "key": "mp_20",
+        "label": "Multiprototype 20%",
+        "method": "multiprototype",
+        "threshold": 20,
+        "arg": "multiprototype_20pct_csv",
+        "bottom_col": "is_bottom_20pct",
+    },
+]
+SCORE_SPEC_BY_KEY = {spec["key"]: spec for spec in SCORE_SOURCE_SPECS}
+
+BADGE_COLOR_BY_COUNT = {
+    1: "#2A9D8F",
+    2: "#E9C46A",
+    3: "#F4A261",
+    4: "#E76F51",
+    5: "#D62828",
+}
+BADGE_SIZE_BY_COUNT = {1: 9, 2: 11, 3: 13, 4: 15, 5: 17}
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -66,6 +122,30 @@ def build_argparser() -> argparse.ArgumentParser:
         help="Centroid score CSV with outlier metrics (relative to cache_dir).",
     )
     parser.add_argument(
+        "--multiprototype_5pct_csv",
+        type=str,
+        default="scores_multiprototype_5pct.csv",
+        help="Multi-prototype 5pct score CSV (relative to cache_dir).",
+    )
+    parser.add_argument(
+        "--multiprototype_10pct_csv",
+        type=str,
+        default="scores_multiprototype_10pct.csv",
+        help="Multi-prototype 10pct score CSV (relative to cache_dir).",
+    )
+    parser.add_argument(
+        "--multiprototype_15pct_csv",
+        type=str,
+        default="scores_multiprototype_15pct.csv",
+        help="Multi-prototype 15pct score CSV (relative to cache_dir).",
+    )
+    parser.add_argument(
+        "--multiprototype_20pct_csv",
+        type=str,
+        default="scores_multiprototype_20pct.csv",
+        help="Multi-prototype 20pct score CSV (relative to cache_dir).",
+    )
+    parser.add_argument(
         "--color_by",
         type=str,
         default="ground_truth_word_label",
@@ -89,6 +169,112 @@ def _build_image_url(root: str, fname: str) -> str:
     return f"{root}/{fname}"
 
 
+def _resolve_csv_path(cache_dir: str, csv_path: str) -> Path | None:
+    if not csv_path:
+        return None
+    path = Path(csv_path)
+    if not path.is_absolute():
+        path = Path(cache_dir) / csv_path
+    return path
+
+
+def _score_columns_for_key(source_key: str) -> tuple[str, str, str]:
+    return (
+        f"{source_key}__flag",
+        f"{source_key}__sim_to_centroid",
+        f"{source_key}__pct_rank_in_class",
+    )
+
+
+def score_custom_columns() -> list[str]:
+    cols: list[str] = []
+    for spec in SCORE_SOURCE_SPECS:
+        cols.extend(_score_columns_for_key(spec["key"]))
+    return cols
+
+
+def _coerce_bool(value) -> bool | float:
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if value is None:
+        return np.nan
+    try:
+        if pd.isna(value):
+            return np.nan
+    except Exception:
+        pass
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "y", "t"}:
+            return True
+        if normalized in {"false", "0", "no", "n", "f"}:
+            return False
+        return np.nan
+    if isinstance(value, (int, np.integer, float, np.floating)):
+        return bool(value)
+    return np.nan
+
+
+def _bool_or_none(value) -> bool | None:
+    parsed = _coerce_bool(value)
+    if isinstance(parsed, (float, np.floating)) and np.isnan(parsed):
+        return None
+    return bool(parsed)
+
+
+def _fmt_num(value, digits: int = 6) -> str:
+    if value is None:
+        return "(missing)"
+    try:
+        if pd.isna(value):
+            return "(missing)"
+    except Exception:
+        pass
+    if isinstance(value, (int, np.integer)):
+        return str(value)
+    if isinstance(value, (float, np.floating)):
+        return f"{value:.{digits}f}"
+    return str(value)
+
+
+def _fmt_pct_rank(value) -> str:
+    base = _fmt_num(value, digits=6)
+    if base == "(missing)":
+        return base
+    try:
+        pct_val = float(value)
+    except Exception:
+        return base
+    return f"{base} ({pct_val * 100:.3f}%)"
+
+
+def _fmt_bool(value) -> str:
+    parsed = _bool_or_none(value)
+    if parsed is None:
+        return "(missing)"
+    return "True" if parsed else "False"
+
+
+def _resolve_threshold(value) -> int:
+    try:
+        raw = int(value)
+    except Exception:
+        return THRESHOLD_STEPS[-1]
+    if raw in THRESHOLD_STEPS:
+        return raw
+    return min(THRESHOLD_STEPS, key=lambda step: abs(step - raw))
+
+
+def active_source_keys(selected_methods, threshold_value) -> list[str]:
+    methods = set(selected_methods or [])
+    threshold = _resolve_threshold(threshold_value)
+    return [
+        spec["key"]
+        for spec in SCORE_SOURCE_SPECS
+        if spec["method"] in methods and spec["threshold"] <= threshold
+    ]
+
+
 def load_data(cache_dir: str, coords_file: str) -> pd.DataFrame:
     cache_root = Path(cache_dir)
     meta_path = cache_root / "metadata.csv"
@@ -110,15 +296,6 @@ def load_data(cache_dir: str, coords_file: str) -> pd.DataFrame:
     df["x"] = coords[:, 0]
     df["y"] = coords[:, 1]
     return df
-
-
-def _resolve_csv_path(cache_dir: str, csv_path: str) -> Path | None:
-    if not csv_path:
-        return None
-    path = Path(csv_path)
-    if not path.is_absolute():
-        path = Path(cache_dir) / csv_path
-    return path
 
 
 def load_rationale_map(csv_path: Path) -> dict[str, dict[str, object]]:
@@ -151,19 +328,152 @@ def load_rationale_map(csv_path: Path) -> dict[str, dict[str, object]]:
     return mapping
 
 
-def load_centroid_scores(csv_path: Path) -> pd.DataFrame:
+def load_score_source(csv_path: Path, source_key: str, bottom_col: str) -> pd.DataFrame:
+    flag_col, sim_col, pct_col = _score_columns_for_key(source_key)
+    output_columns = ["file_name", flag_col, sim_col, pct_col]
     df = pd.read_csv(csv_path)
-    required = {"file_name", "sim_to_centroid", "pct_rank_in_class", "is_bottom_5pct"}
+
+    required = {"file_name", "sim_to_centroid", "pct_rank_in_class", bottom_col}
     missing = required - set(df.columns)
     if missing:
         print(f"[warn] {csv_path.name} missing columns: {sorted(missing)}; skipping.")
-        return pd.DataFrame(columns=["file_name", "sim_to_centroid", "pct_rank_in_class", "is_bottom_5pct"])
-    return df[list(required)]
+        return pd.DataFrame(columns=output_columns)
+
+    dup_count = int(df["file_name"].duplicated().sum())
+    if dup_count:
+        print(f"[warn] {csv_path.name} has {dup_count} duplicate file_name rows; keeping first.")
+        df = df.drop_duplicates(subset=["file_name"], keep="first")
+
+    flag_series = df[bottom_col].map(_coerce_bool)
+    invalid_mask = df[bottom_col].notna() & flag_series.isna()
+    invalid_count = int(invalid_mask.sum())
+    if invalid_count:
+        print(f"[warn] {csv_path.name} has {invalid_count} invalid {bottom_col} values; coerced to False.")
+
+    out = pd.DataFrame(
+        {
+            "file_name": df["file_name"],
+            flag_col: flag_series.fillna(False).astype(bool),
+            sim_col: pd.to_numeric(df["sim_to_centroid"], errors="coerce"),
+            pct_col: pd.to_numeric(df["pct_rank_in_class"], errors="coerce"),
+        }
+    )
+    return out
+
+
+def merge_score_sources(df: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
+    out = df
+    for spec in SCORE_SOURCE_SPECS:
+        csv_arg = getattr(args, spec["arg"])
+        csv_path = _resolve_csv_path(args.cache_dir, csv_arg)
+        if csv_path and csv_path.is_file():
+            source_df = load_score_source(csv_path, spec["key"], spec["bottom_col"])
+            if not source_df.empty:
+                out = out.merge(source_df, on="file_name", how="left")
+        elif csv_arg:
+            print(f"[warn] {spec['arg']} '{csv_path}' not found; skipping.")
+    return out
+
+
+def compute_overlay_df(df: pd.DataFrame, active_keys: list[str]) -> pd.DataFrame:
+    if not active_keys:
+        return pd.DataFrame(columns=list(df.columns) + ["active_flag_count", "badge_color", "badge_size"])
+
+    counts = np.zeros(len(df), dtype=int)
+    for key in active_keys:
+        flag_col, _, _ = _score_columns_for_key(key)
+        if flag_col not in df.columns:
+            continue
+        counts += df[flag_col].fillna(False).astype(bool).astype(int).to_numpy()
+
+    mask = counts > 0
+    if not mask.any():
+        return pd.DataFrame(columns=list(df.columns) + ["active_flag_count", "badge_color", "badge_size"])
+
+    overlay = df.loc[mask].copy()
+    overlay["active_flag_count"] = counts[mask]
+    max_bucket = max(BADGE_COLOR_BY_COUNT)
+    overlay["badge_color"] = overlay["active_flag_count"].map(BADGE_COLOR_BY_COUNT).fillna(BADGE_COLOR_BY_COUNT[max_bucket])
+    overlay["badge_size"] = overlay["active_flag_count"].map(BADGE_SIZE_BY_COUNT).fillna(BADGE_SIZE_BY_COUNT[max_bucket])
+    return overlay
+
+
+def build_scatter_figure(
+    df: pd.DataFrame,
+    color_col: str | None,
+    hover_cols: list[str] | None,
+    custom_cols: list[str],
+    active_keys: list[str],
+) -> go.Figure:
+    fig = px.scatter(
+        df,
+        x="x",
+        y="y",
+        color=color_col,
+        hover_data=hover_cols,
+        custom_data=custom_cols,
+        title="Embedding Viewer",
+    )
+    fig.update_traces(marker=dict(size=6, opacity=0.8))
+
+    if color_col:
+        for trace in fig.data:
+            if getattr(trace, "name", None) is not None:
+                trace.legendgroup = str(trace.name)
+        fig.update_layout(legend=dict(groupclick="togglegroup"))
+
+    overlay = compute_overlay_df(df, active_keys)
+    if overlay.empty:
+        return fig
+
+    if color_col:
+        for class_name, class_df in overlay.groupby(color_col, dropna=False):
+            if class_df.empty:
+                continue
+            legend_group = "(missing class)" if pd.isna(class_name) else str(class_name)
+            fig.add_trace(
+                go.Scattergl(
+                    x=class_df["x"],
+                    y=class_df["y"],
+                    mode="markers",
+                    name=f"Outlier badges ({legend_group})",
+                    legendgroup=legend_group,
+                    marker=dict(
+                        symbol="circle-open",
+                        color=class_df["badge_color"].tolist(),
+                        size=class_df["badge_size"].tolist(),
+                        line=dict(width=1.5),
+                    ),
+                    customdata=class_df[custom_cols].to_numpy(),
+                    hoverinfo="skip",
+                    showlegend=False,
+                )
+            )
+    else:
+        fig.add_trace(
+            go.Scattergl(
+                x=overlay["x"],
+                y=overlay["y"],
+                mode="markers",
+                name="Outlier badges (active)",
+                marker=dict(
+                    symbol="circle-open",
+                    color=overlay["badge_color"].tolist(),
+                    size=overlay["badge_size"].tolist(),
+                    line=dict(width=1.5),
+                ),
+                customdata=overlay[custom_cols].to_numpy(),
+                hoverinfo="skip",
+                showlegend=True,
+            )
+        )
+    return fig
 
 
 def main() -> None:
     args = build_argparser().parse_args()
     df = load_data(args.cache_dir, args.coords_file)
+    df = merge_score_sources(df, args)
 
     image_root_url = ""
     image_dir = ""
@@ -193,14 +503,6 @@ def main() -> None:
     elif args.correct_csv:
         print(f"[warn] correct_csv '{correct_path}' not found; skipping.")
 
-    centroid_path = _resolve_csv_path(args.cache_dir, args.centroid_csv)
-    if centroid_path and centroid_path.is_file():
-        centroid_df = load_centroid_scores(centroid_path)
-        if not centroid_df.empty:
-            df = df.merge(centroid_df, on="file_name", how="left")
-    elif args.centroid_csv:
-        print(f"[warn] centroid_csv '{centroid_path}' not found; skipping.")
-
     hover_cols = [c.strip() for c in str(args.hover).split(",") if c.strip()]
     hover_cols = [c for c in hover_cols if c in df.columns]
     if not hover_cols:
@@ -219,88 +521,67 @@ def main() -> None:
     else:
         df["img_url"] = ""
 
-    custom_cols = [
-        "img_url",
-        "file_name",
-        "ground_truth_word_label",
-        "sim_to_centroid",
-        "pct_rank_in_class",
-        "is_bottom_5pct",
-    ]
-    for col in custom_cols:
+    score_cols = score_custom_columns()
+    custom_cols = ["img_url", "file_name", "ground_truth_word_label"] + score_cols
+    for col in score_cols:
         if col not in df.columns:
-            df[col] = False if col == "is_bottom_5pct" else np.nan
-
-    fig = px.scatter(
-        df,
-        x="x",
-        y="y",
-        color=color_col,
-        hover_data=hover_cols,
-        custom_data=custom_cols,
-        title="Embedding Viewer",
-    )
-    fig.update_traces(marker=dict(size=6, opacity=0.8))
-
-    if "is_bottom_5pct" in df.columns:
-        bottom_mask = df["is_bottom_5pct"] == True
-        df_bottom = df[bottom_mask]
-        if not df_bottom.empty:
-            if color_col:
-                for trace in fig.data:
-                    if getattr(trace, "name", None) is not None:
-                        trace.legendgroup = str(trace.name)
-                for class_name, class_df in df_bottom.groupby(color_col, dropna=False):
-                    if class_df.empty:
-                        continue
-                    legend_group = "(missing class)" if pd.isna(class_name) else str(class_name)
-                    fig.add_trace(
-                        go.Scattergl(
-                            x=class_df["x"],
-                            y=class_df["y"],
-                            mode="markers",
-                            name=f"Bottom 5% ({legend_group})",
-                            legendgroup=legend_group,
-                            marker=dict(
-                                size=10,
-                                symbol="circle-open",
-                                # For open symbols, Plotly uses marker.color for the outline.
-                                color="#FF5500",
-                            ),
-                            customdata=class_df[custom_cols].to_numpy(),
-                            hoverinfo="skip",
-                            showlegend=False,
-                        )
-                    )
-                fig.update_layout(legend=dict(groupclick="togglegroup"))
+            if col.endswith("__flag"):
+                df[col] = False
             else:
-                fig.add_trace(
-                    go.Scattergl(
-                        x=df_bottom["x"],
-                        y=df_bottom["y"],
-                        mode="markers",
-                        name="Bottom 5% (centroid)",
-                        marker=dict(
-                            size=10,
-                            symbol="circle-open",
-                            # For open symbols, Plotly uses marker.color for the outline.
-                            color="#FF5500",
-                        ),
-                        customdata=df_bottom[custom_cols].to_numpy(),
-                        hoverinfo="skip",
-                        showlegend=True,
-                    )
-                )
+                df[col] = np.nan
+
+    custom_idx = {name: idx for idx, name in enumerate(custom_cols)}
+
+    def _custom_get(custom_data, col_name: str, default=None):
+        idx = custom_idx[col_name]
+        if len(custom_data) <= idx:
+            return default
+        return custom_data[idx]
+
+    initial_active = active_source_keys(DEFAULT_METHODS, THRESHOLD_STEPS[-1])
+    initial_fig = build_scatter_figure(df, color_col, hover_cols, custom_cols, initial_active)
 
     app = Dash(__name__)
     if image_dir:
+
         @app.server.route("/images/<path:filename>")
         def _serve_image(filename: str):
             return send_from_directory(image_dir, filename)
+
     app.layout = html.Div(
         [
             html.Div(
-                dcc.Graph(id="embed-graph", figure=fig, style={"height": "85vh"}),
+                [
+                    html.Div(
+                        [
+                            html.Div("Outlier Controls", style={"fontWeight": "600", "marginBottom": "6px"}),
+                            dcc.Checklist(
+                                id="outlier-methods",
+                                options=[
+                                    {"label": "Centroid", "value": "centroid"},
+                                    {"label": "Multi-prototype", "value": "multiprototype"},
+                                ],
+                                value=DEFAULT_METHODS,
+                                inline=True,
+                                inputStyle={"marginRight": "4px", "marginLeft": "8px"},
+                            ),
+                            html.Div(
+                                "Threshold (cumulative <= %)",
+                                style={"fontSize": "12px", "marginTop": "8px", "marginBottom": "4px"},
+                            ),
+                            dcc.Slider(
+                                id="outlier-threshold",
+                                min=min(THRESHOLD_STEPS),
+                                max=max(THRESHOLD_STEPS),
+                                step=None,
+                                value=THRESHOLD_STEPS[-1],
+                                marks={step: f"{step}%" for step in THRESHOLD_STEPS},
+                            ),
+                        ],
+                        style={"padding": "10px 12px", "borderBottom": "1px solid #ddd"},
+                    ),
+                    dcc.Graph(id="embed-graph", figure=initial_fig, style={"height": "79vh"}),
+                ],
                 style={"flex": "3", "minWidth": "0"},
             ),
             html.Div(
@@ -312,26 +593,37 @@ def main() -> None:
                     ),
                     html.Div(id="img-caption", style={"marginTop": "8px", "fontSize": "12px", "color": "#555"}),
                 ],
-                style={"flex": "1", "borderLeft": "1px solid #ddd", "padding": "12px"},
+                style={"flex": "1", "borderLeft": "1px solid #ddd", "padding": "12px", "overflowY": "auto"},
             ),
         ],
         style={"display": "flex", "height": "100vh", "gap": "8px"},
     )
 
     @app.callback(
+        Output("embed-graph", "figure"),
+        Input("outlier-methods", "value"),
+        Input("outlier-threshold", "value"),
+    )
+    def _update_graph(selected_methods, threshold_value):
+        active_keys = active_source_keys(selected_methods, threshold_value)
+        return build_scatter_figure(df, color_col, hover_cols, custom_cols, active_keys)
+
+    @app.callback(
         Output("img-view", "src"),
         Output("img-caption", "children"),
         Input("embed-graph", "clickData"),
+        Input("outlier-methods", "value"),
+        Input("outlier-threshold", "value"),
     )
-    def _on_click(click_data):
+    def _on_click(click_data, selected_methods, threshold_value):
         if not click_data or "points" not in click_data or not click_data["points"]:
             return "", "Click a point to load image."
+
         custom = click_data["points"][0].get("customdata", [])
-        img_url = custom[0] if len(custom) > 0 else ""
-        fname = custom[1] if len(custom) > 1 else ""
-        gt_word = custom[2] if len(custom) > 2 else ""
-        sim_to_centroid = custom[3] if len(custom) > 3 else None
-        pct_rank = custom[4] if len(custom) > 4 else None
+        img_url = _custom_get(custom, "img_url", "")
+        fname = _custom_get(custom, "file_name", "")
+        gt_word = _custom_get(custom, "ground_truth_word_label", "")
+
         mis_entry = mis_map.get(fname)
         correct_entry = correct_map.get(fname)
         if mis_entry and correct_entry:
@@ -347,49 +639,66 @@ def main() -> None:
             prediction = "unknown (not found)"
             entry = None
 
-        def _format_entry(entry: dict[str, object] | None):
-            if entry is None:
+        def _format_entry(score_entry: dict[str, object] | None):
+            if score_entry is None:
                 return [
                     html.Div("LLM score: (not found)"),
                     html.Div("LLM rationale: (not found)"),
                 ]
-            score = entry.get("score", "")
-            rationale = entry.get("rationale", "")
+            score = score_entry.get("score", "")
+            rationale = score_entry.get("rationale", "")
             return [
+                html.Div(f"LLM score: {score}" if score != "" else "LLM score: (missing)"),
                 html.Div(
-                    f"LLM score: {score}"
-                    if score != ""
-                    else "LLM score: (missing)"
-                ),
-                html.Div(
-                    f"LLM rationale: {rationale}"
-                    if rationale != ""
-                    else "LLM rationale: (missing)",
+                    f"LLM rationale: {rationale}" if rationale != "" else "LLM rationale: (missing)",
                     style={"whiteSpace": "pre-wrap"},
                 ),
             ]
 
-        def _fmt_num(val, digits: int = 6) -> str:
-            if val is None:
-                return "(missing)"
-            try:
-                if pd.isna(val):
-                    return "(missing)"
-            except Exception:
-                pass
-            if isinstance(val, (int, np.integer)):
-                return str(val)
-            if isinstance(val, (float, np.floating)):
-                return f"{val:.{digits}f}"
-            return str(val)
+        active_keys = active_source_keys(selected_methods, threshold_value)
+        active_labels: list[str] = []
+        for key in active_keys:
+            flag_col, _, _ = _score_columns_for_key(key)
+            if _bool_or_none(_custom_get(custom, flag_col)) is True:
+                active_labels.append(SCORE_SPEC_BY_KEY[key]["label"])
 
-        pct_rank_str = _fmt_num(pct_rank, digits=6)
-        if pct_rank_str not in ("(missing)",):
-            try:
-                pct_val = float(pct_rank)
-                pct_rank_str = f"{pct_rank_str} ({pct_val * 100:.3f}%)"
-            except Exception:
-                pass
+        active_flag_summary = f"Active outlier flags: {len(active_labels)} / {len(active_keys)}"
+        flagged_by_summary = "Flagged by: " + (", ".join(active_labels) if active_labels else "(none)")
+
+        table_rows = []
+        td_style = {"borderBottom": "1px solid #e6e6e6", "padding": "4px 6px", "verticalAlign": "top"}
+        for spec in SCORE_SOURCE_SPECS:
+            flag_col, sim_col, pct_col = _score_columns_for_key(spec["key"])
+            flag_value = _custom_get(custom, flag_col)
+            row_style = {"backgroundColor": "#fff8e6"} if _bool_or_none(flag_value) is True else {}
+            table_rows.append(
+                html.Tr(
+                    [
+                        html.Td(spec["label"], style=td_style),
+                        html.Td(_fmt_bool(flag_value), style=td_style),
+                        html.Td(_fmt_num(_custom_get(custom, sim_col), digits=6), style=td_style),
+                        html.Td(_fmt_pct_rank(_custom_get(custom, pct_col)), style=td_style),
+                    ],
+                    style=row_style,
+                )
+            )
+
+        table = html.Table(
+            [
+                html.Thead(
+                    html.Tr(
+                        [
+                            html.Th("Source", style={"textAlign": "left", "padding": "4px 6px"}),
+                            html.Th("Bottom Flag", style={"textAlign": "left", "padding": "4px 6px"}),
+                            html.Th("sim_to_centroid", style={"textAlign": "left", "padding": "4px 6px"}),
+                            html.Th("pct_rank_in_class", style={"textAlign": "left", "padding": "4px 6px"}),
+                        ]
+                    )
+                ),
+                html.Tbody(table_rows),
+            ],
+            style={"width": "100%", "borderCollapse": "collapse", "fontSize": "12px", "marginTop": "6px"},
+        )
 
         caption = [
             html.Div(f"file_name: {fname}" if fname else "file_name: (missing)"),
@@ -400,8 +709,11 @@ def main() -> None:
             ),
             html.Div(f"prediction: {prediction}"),
             *_format_entry(entry),
-            html.Div(f"sim_to_centroid: {_fmt_num(sim_to_centroid, digits=6)}"),
-            html.Div(f"pct_rank_in_class: {pct_rank_str}"),
+            html.Hr(),
+            html.Div(active_flag_summary, style={"fontWeight": "600"}),
+            html.Div(flagged_by_summary),
+            html.Hr(),
+            table,
         ]
         return img_url, caption
 
