@@ -246,23 +246,51 @@ def main() -> None:
         bottom_mask = df["is_bottom_5pct"] == True
         df_bottom = df[bottom_mask]
         if not df_bottom.empty:
-            fig.add_trace(
-                go.Scattergl(
-                    x=df_bottom["x"],
-                    y=df_bottom["y"],
-                    mode="markers",
-                    name="Bottom 5% (centroid)",
-                    marker=dict(
-                        size=10,
-                        symbol="circle-open",
-                        # For open symbols, Plotly uses marker.color for the outline.
-                        color="#FF5500",
-                    ),
-                    customdata=df_bottom[custom_cols].to_numpy(),
-                    hoverinfo="skip",
-                    showlegend=True,
+            if color_col:
+                for trace in fig.data:
+                    if getattr(trace, "name", None) is not None:
+                        trace.legendgroup = str(trace.name)
+                for class_name, class_df in df_bottom.groupby(color_col, dropna=False):
+                    if class_df.empty:
+                        continue
+                    legend_group = "(missing class)" if pd.isna(class_name) else str(class_name)
+                    fig.add_trace(
+                        go.Scattergl(
+                            x=class_df["x"],
+                            y=class_df["y"],
+                            mode="markers",
+                            name=f"Bottom 5% ({legend_group})",
+                            legendgroup=legend_group,
+                            marker=dict(
+                                size=10,
+                                symbol="circle-open",
+                                # For open symbols, Plotly uses marker.color for the outline.
+                                color="#FF5500",
+                            ),
+                            customdata=class_df[custom_cols].to_numpy(),
+                            hoverinfo="skip",
+                            showlegend=False,
+                        )
+                    )
+                fig.update_layout(legend=dict(groupclick="togglegroup"))
+            else:
+                fig.add_trace(
+                    go.Scattergl(
+                        x=df_bottom["x"],
+                        y=df_bottom["y"],
+                        mode="markers",
+                        name="Bottom 5% (centroid)",
+                        marker=dict(
+                            size=10,
+                            symbol="circle-open",
+                            # For open symbols, Plotly uses marker.color for the outline.
+                            color="#FF5500",
+                        ),
+                        customdata=df_bottom[custom_cols].to_numpy(),
+                        hoverinfo="skip",
+                        showlegend=True,
+                    )
                 )
-            )
 
     app = Dash(__name__)
     if image_dir:
