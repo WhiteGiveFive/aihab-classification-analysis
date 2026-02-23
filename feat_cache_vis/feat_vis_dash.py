@@ -22,6 +22,8 @@ from flask import send_from_directory
 
 THRESHOLD_STEPS = [5, 10, 15, 20]
 DEFAULT_METHODS = ["centroid", "multiprototype"]
+LLM_CUTOFF_MIN = 1
+LLM_CUTOFF_MAX = 5
 
 SCORE_SOURCE_SPECS = [
     {
@@ -31,6 +33,7 @@ SCORE_SOURCE_SPECS = [
         "threshold": 5,
         "arg": "centroid_csv",
         "bottom_col": "is_bottom_5pct",
+        "used_in_review_rule": True,
     },
     {
         "key": "mp_5",
@@ -39,6 +42,7 @@ SCORE_SOURCE_SPECS = [
         "threshold": 5,
         "arg": "multiprototype_5pct_csv",
         "bottom_col": "is_bottom_5pct",
+        "used_in_review_rule": False,
     },
     {
         "key": "mp_10",
@@ -47,6 +51,7 @@ SCORE_SOURCE_SPECS = [
         "threshold": 10,
         "arg": "multiprototype_10pct_csv",
         "bottom_col": "is_bottom_10pct",
+        "used_in_review_rule": True,
     },
     {
         "key": "mp_15",
@@ -55,6 +60,7 @@ SCORE_SOURCE_SPECS = [
         "threshold": 15,
         "arg": "multiprototype_15pct_csv",
         "bottom_col": "is_bottom_15pct",
+        "used_in_review_rule": False,
     },
     {
         "key": "mp_20",
@@ -63,6 +69,7 @@ SCORE_SOURCE_SPECS = [
         "threshold": 20,
         "arg": "multiprototype_20pct_csv",
         "bottom_col": "is_bottom_20pct",
+        "used_in_review_rule": False,
     },
 ]
 SCORE_SPEC_BY_KEY = {spec["key"]: spec for spec in SCORE_SOURCE_SPECS}
@@ -156,6 +163,12 @@ def build_argparser() -> argparse.ArgumentParser:
         type=str,
         default="file_name,ground_truth_word_label,ground_truth_num_label",
         help="Comma-separated metadata columns to show on hover.",
+    )
+    parser.add_argument(
+        "--default_llm_cutoff",
+        type=int,
+        default=3,
+        help="Default LLM score cutoff for review subset mode.",
     )
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Dash host.")
     parser.add_argument("--port", type=int, default=8050, help="Dash port.")
@@ -265,6 +278,14 @@ def _resolve_threshold(value) -> int:
     return min(THRESHOLD_STEPS, key=lambda step: abs(step - raw))
 
 
+def _resolve_llm_cutoff(value) -> int:
+    try:
+        raw = int(value)
+    except Exception:
+        raw = 3
+    return max(LLM_CUTOFF_MIN, min(LLM_CUTOFF_MAX, raw))
+
+
 def active_source_keys(selected_methods, threshold_value) -> list[str]:
     methods = set(selected_methods or [])
     threshold = _resolve_threshold(threshold_value)
@@ -273,6 +294,84 @@ def active_source_keys(selected_methods, threshold_value) -> list[str]:
         for spec in SCORE_SOURCE_SPECS
         if spec["method"] in methods and spec["threshold"] <= threshold
     ]
+
+
+def _parse_score_from_rationale(raw) -> float | None:
+    if not isinstance(raw, str):
+        return None
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    score = obj.get("score")
+    if score is None:
+        return None
+    try:
+        return float(score)
+    except Exception:
+        return None
+
+
+def load_llm_score_map(csv_paths: list[Path]) -> dict[str, float]:
+    score_map: dict[str, float] = {}
+    duplicate_count = 0
+
+    for path in csv_paths:
+        if not path.is_file():
+            continue
+        df = pd.read_csv(path)
+        if "file_name" not in df.columns or "rationale" not in df.columns:
+            print(f"[warn] {path.name} missing file_name or rationale; skipping for llm_score.")
+            continue
+
+        bad_score = 0
+        for row in df.itertuples(index=False):
+            fname = getattr(row, "file_name", None)
+            raw = getattr(row, "rationale", None)
+            if not isinstance(fname, str):
+                continue
+            if fname in score_map:
+                duplicate_count += 1
+                continue
+            score = _parse_score_from_rationale(raw)
+            if score is None:
+                bad_score += 1
+                continue
+            score_map[fname] = score
+        if bad_score:
+            print(f"[warn] {path.name} has {bad_score} rows with invalid/missing rationale score.")
+
+    if duplicate_count:
+        print(f"[warn] LLM score inputs have {duplicate_count} duplicate file_name rows; keeping first.")
+    return score_map
+
+
+def is_review_subset_enabled(values) -> bool:
+    return "on" in set(values or [])
+
+
+def compute_review_mask(df: pd.DataFrame, llm_cutoff: int) -> pd.Series:
+    centroid_flag_col = _score_columns_for_key("centroid_5")[0]
+    mp10_flag_col = _score_columns_for_key("mp_10")[0]
+
+    rule_centroid = (
+        df[centroid_flag_col].fillna(False).astype(bool)
+        if centroid_flag_col in df.columns
+        else pd.Series(False, index=df.index)
+    )
+    rule_mp10 = (
+        df[mp10_flag_col].fillna(False).astype(bool)
+        if mp10_flag_col in df.columns
+        else pd.Series(False, index=df.index)
+    )
+    rule_llm = (
+        df["llm_score"].notna() & (df["llm_score"] <= llm_cutoff)
+        if "llm_score" in df.columns
+        else pd.Series(False, index=df.index)
+    )
+    return rule_centroid | rule_mp10 | rule_llm
 
 
 def load_data(cache_dir: str, coords_file: str) -> pd.DataFrame:
@@ -503,6 +602,14 @@ def main() -> None:
     elif args.correct_csv:
         print(f"[warn] correct_csv '{correct_path}' not found; skipping.")
 
+    llm_score_sources = []
+    if mis_path and mis_path.is_file():
+        llm_score_sources.append(mis_path)
+    if correct_path and correct_path.is_file():
+        llm_score_sources.append(correct_path)
+    llm_score_map = load_llm_score_map(llm_score_sources)
+    df["llm_score"] = df["file_name"].map(llm_score_map)
+
     hover_cols = [c.strip() for c in str(args.hover).split(",") if c.strip()]
     hover_cols = [c for c in hover_cols if c in df.columns]
     if not hover_cols:
@@ -522,7 +629,7 @@ def main() -> None:
         df["img_url"] = ""
 
     score_cols = score_custom_columns()
-    custom_cols = ["img_url", "file_name", "ground_truth_word_label"] + score_cols
+    custom_cols = ["img_url", "file_name", "ground_truth_word_label", "llm_score"] + score_cols
     for col in score_cols:
         if col not in df.columns:
             if col.endswith("__flag"):
@@ -538,6 +645,7 @@ def main() -> None:
             return default
         return custom_data[idx]
 
+    initial_llm_cutoff = _resolve_llm_cutoff(args.default_llm_cutoff)
     initial_active = active_source_keys(DEFAULT_METHODS, THRESHOLD_STEPS[-1])
     initial_fig = build_scatter_figure(df, color_col, hover_cols, custom_cols, initial_active)
 
@@ -577,6 +685,25 @@ def main() -> None:
                                 value=THRESHOLD_STEPS[-1],
                                 marks={step: f"{step}%" for step in THRESHOLD_STEPS},
                             ),
+                            html.Hr(style={"margin": "10px 0"}),
+                            dcc.Checklist(
+                                id="review-subset-only",
+                                options=[{"label": "Review subset only", "value": "on"}],
+                                value=[],
+                                inputStyle={"marginRight": "6px"},
+                            ),
+                            html.Div(
+                                "LLM score cutoff (review rule)",
+                                style={"fontSize": "12px", "marginTop": "8px", "marginBottom": "4px"},
+                            ),
+                            dcc.Slider(
+                                id="review-llm-cutoff",
+                                min=LLM_CUTOFF_MIN,
+                                max=LLM_CUTOFF_MAX,
+                                step=1,
+                                value=initial_llm_cutoff,
+                                marks={v: str(v) for v in range(LLM_CUTOFF_MIN, LLM_CUTOFF_MAX + 1)},
+                            ),
                         ],
                         style={"padding": "10px 12px", "borderBottom": "1px solid #ddd"},
                     ),
@@ -603,10 +730,19 @@ def main() -> None:
         Output("embed-graph", "figure"),
         Input("outlier-methods", "value"),
         Input("outlier-threshold", "value"),
+        Input("review-subset-only", "value"),
+        Input("review-llm-cutoff", "value"),
     )
-    def _update_graph(selected_methods, threshold_value):
+    def _update_graph(selected_methods, threshold_value, review_subset_values, llm_cutoff_value):
+        llm_cutoff = _resolve_llm_cutoff(llm_cutoff_value)
+        review_only = is_review_subset_enabled(review_subset_values)
+        if review_only:
+            review_mask = compute_review_mask(df, llm_cutoff)
+            df_plot = df.loc[review_mask].copy()
+        else:
+            df_plot = df
         active_keys = active_source_keys(selected_methods, threshold_value)
-        return build_scatter_figure(df, color_col, hover_cols, custom_cols, active_keys)
+        return build_scatter_figure(df_plot, color_col, hover_cols, custom_cols, active_keys)
 
     @app.callback(
         Output("img-view", "src"),
@@ -614,8 +750,10 @@ def main() -> None:
         Input("embed-graph", "clickData"),
         Input("outlier-methods", "value"),
         Input("outlier-threshold", "value"),
+        Input("review-subset-only", "value"),
+        Input("review-llm-cutoff", "value"),
     )
-    def _on_click(click_data, selected_methods, threshold_value):
+    def _on_click(click_data, selected_methods, threshold_value, review_subset_values, llm_cutoff_value):
         if not click_data or "points" not in click_data or not click_data["points"]:
             return "", "Click a point to load image."
 
@@ -623,6 +761,8 @@ def main() -> None:
         img_url = _custom_get(custom, "img_url", "")
         fname = _custom_get(custom, "file_name", "")
         gt_word = _custom_get(custom, "ground_truth_word_label", "")
+        llm_score = _custom_get(custom, "llm_score", None)
+        llm_cutoff = _resolve_llm_cutoff(llm_cutoff_value)
 
         mis_entry = mis_map.get(fname)
         correct_entry = correct_map.get(fname)
@@ -665,6 +805,27 @@ def main() -> None:
         active_flag_summary = f"Active outlier flags: {len(active_labels)} / {len(active_keys)}"
         flagged_by_summary = "Flagged by: " + (", ".join(active_labels) if active_labels else "(none)")
 
+        centroid_flag_col = _score_columns_for_key("centroid_5")[0]
+        mp10_flag_col = _score_columns_for_key("mp_10")[0]
+        rule_centroid = _bool_or_none(_custom_get(custom, centroid_flag_col)) is True
+        rule_mp10 = _bool_or_none(_custom_get(custom, mp10_flag_col)) is True
+        rule_llm = False
+        try:
+            if llm_score is not None and not pd.isna(llm_score):
+                rule_llm = float(llm_score) <= llm_cutoff
+        except Exception:
+            rule_llm = False
+        review_match = rule_centroid or rule_mp10 or rule_llm
+        review_rule_labels = []
+        if rule_centroid:
+            review_rule_labels.append("centroid_bottom5")
+        if rule_mp10:
+            review_rule_labels.append("mp10_bottom10")
+        if rule_llm:
+            review_rule_labels.append(f"llm<={llm_cutoff}")
+        review_rules_line = "Review rules active: " + (", ".join(review_rule_labels) if review_rule_labels else "(none)")
+        review_mode_line = "Review subset only: " + ("on" if is_review_subset_enabled(review_subset_values) else "off")
+
         table_rows = []
         td_style = {"borderBottom": "1px solid #e6e6e6", "padding": "4px 6px", "verticalAlign": "top"}
         for spec in SCORE_SOURCE_SPECS:
@@ -675,6 +836,7 @@ def main() -> None:
                 html.Tr(
                     [
                         html.Td(spec["label"], style=td_style),
+                        html.Td("Yes" if spec.get("used_in_review_rule") else "No", style=td_style),
                         html.Td(_fmt_bool(flag_value), style=td_style),
                         html.Td(_fmt_num(_custom_get(custom, sim_col), digits=6), style=td_style),
                         html.Td(_fmt_pct_rank(_custom_get(custom, pct_col)), style=td_style),
@@ -689,6 +851,7 @@ def main() -> None:
                     html.Tr(
                         [
                             html.Th("Source", style={"textAlign": "left", "padding": "4px 6px"}),
+                            html.Th("Used in Review Rule", style={"textAlign": "left", "padding": "4px 6px"}),
                             html.Th("Bottom Flag", style={"textAlign": "left", "padding": "4px 6px"}),
                             html.Th("sim_to_centroid", style={"textAlign": "left", "padding": "4px 6px"}),
                             html.Th("pct_rank_in_class", style={"textAlign": "left", "padding": "4px 6px"}),
@@ -712,6 +875,10 @@ def main() -> None:
             html.Hr(),
             html.Div(active_flag_summary, style={"fontWeight": "600"}),
             html.Div(flagged_by_summary),
+            html.Div(f"Review subset match: {'True' if review_match else 'False'}"),
+            html.Div(review_rules_line),
+            html.Div(f"Current LLM cutoff: {llm_cutoff}"),
+            html.Div(review_mode_line),
             html.Hr(),
             table,
         ]

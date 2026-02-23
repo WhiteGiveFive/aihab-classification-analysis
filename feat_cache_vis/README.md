@@ -85,16 +85,35 @@ Defaults (relative to `--cache_dir`):
 The graph includes controls above the scatter:
 - Method toggles: `Centroid`, `Multi-prototype`
 - Threshold slider: `5%`, `10%`, `15%`, `20%` with cumulative semantics (`<= threshold`)
+- Review subset toggle: `Review subset only`
+- Review LLM cutoff slider: integer `1..5` (default `3`)
 
 Badge behavior:
 - One outlier badge per point (single badge encoding).
 - Badge size/color represents how many active sources flagged the point.
 - If classes are shown via `--color_by`, badge visibility follows class legend toggles.
 
+## Expert Review Subset Rule
+When `Review subset only` is enabled, the graph is filtered to samples matching:
+- `centroid_5 flag == True` OR
+- `multiprototype_10 flag == True` OR
+- `llm_score <= cutoff`
+
+`llm_score` is parsed from `rationale.score` in both:
+- `mis_Qwen_Qwen3-VL-4B-Instruct.csv`
+- `correct_Qwen_Qwen3-VL-4B-Instruct.csv`
+
+The panel shows:
+- `Review subset match`
+- `Review rules active`
+- `Current LLM cutoff`
+- A compact per-source table with `Used in Review Rule`.
+
 ## Other Options
 - `--color_by` (default: `ground_truth_word_label`)
 - `--hover` (default: `file_name,ground_truth_word_label,ground_truth_num_label`)
 - `--image_root` (URL prefix if you already host images elsewhere)
+- `--default_llm_cutoff` (default: `3`)
 
 ## Notes
 - Images are resolved by `file_name` and served from `--image_dir` at `/images/<file_name>`.
