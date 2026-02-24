@@ -114,6 +114,37 @@ The panel shows:
 - `--hover` (default: `file_name,ground_truth_word_label,ground_truth_num_label`)
 - `--image_root` (URL prefix if you already host images elsewhere)
 - `--default_llm_cutoff` (default: `3`)
+- `--review_output_csv` (default: `feat_cache_vis/examiner_confirmed_true_outliers.csv`)
+- `--reviewer_id` (default: `unknown`)
+
+## Examiner Confirmation Workflow
+In the right panel:
+- Click a point on the graph.
+- Click `Mark True Outlier` to confirm.
+- Click `Unmark` to remove a prior confirmation.
+
+Behavior:
+- The app keeps one confirmed row per `file_name` (upsert/remove).
+- On every mark/unmark action, it auto-saves the full confirmed set to `--review_output_csv`.
+- Save status and confirmed count are shown in the panel.
+
+### Confirmed CSV Schema
+The output CSV columns are:
+- `file_name`
+- `ground_truth_num_label`
+- `ground_truth_word_label`
+- `ground_truth_L2_num_label`
+- `predicted_label`
+- `predicted_word_label`
+- `centroid_sim_to_centroid`
+- `centroid_pct_rank_in_class`
+- `centroid_is_bottom_5pct`
+- `mp10_sim_to_centroid`
+- `mp10_pct_rank_in_class`
+- `mp10_is_bottom_10pct`
+- `mp10_margin_to_other_class`
+- `reviewer_id`
+- `reviewed_at_utc`
 
 ## Notes
 - Images are resolved by `file_name` and served from `--image_dir` at `/images/<file_name>`.

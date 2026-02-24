@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from dash import Dash, Input, Output, dcc, html
+from dash import Dash, Input, Output, State, ctx, dcc, html, no_update
 from flask import send_from_directory
 
 THRESHOLD_STEPS = [5, 10, 15, 20]
@@ -82,6 +82,48 @@ BADGE_COLOR_BY_COUNT = {
     5: "#D62828",
 }
 BADGE_SIZE_BY_COUNT = {1: 9, 2: 11, 3: 13, 4: 15, 5: 17}
+MP10_MARGIN_COLUMN = "mp_10__margin_to_other_class"
+PREDICTION_COLUMNS = [
+    "predicted_label",
+    "predicted_word_label",
+    "dataset",
+    "top3_label_1",
+    "top3_prob_1",
+    "top3_label_2",
+    "top3_prob_2",
+    "top3_label_3",
+    "top3_prob_3",
+    "split",
+    "image_path",
+    "rationale",
+]
+EXPORT_COLUMNS = [
+    "file_name",
+    "ground_truth_num_label",
+    "ground_truth_word_label",
+    "ground_truth_L2_num_label",
+    "predicted_label",
+    "predicted_word_label",
+    "dataset",
+    "top3_label_1",
+    "top3_prob_1",
+    "top3_label_2",
+    "top3_prob_2",
+    "top3_label_3",
+    "top3_prob_3",
+    "split",
+    "image_path",
+    "rationale",
+    "centroid_sim_to_centroid",
+    "centroid_pct_rank_in_class",
+    "centroid_is_bottom_5pct",
+    "mp10_sim_to_centroid",
+    "mp10_pct_rank_in_class",
+    "mp10_is_bottom_10pct",
+    "mp10_margin_to_other_class",
+    "reviewer_id",
+    "reviewed_at_utc",
+]
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -169,6 +211,18 @@ def build_argparser() -> argparse.ArgumentParser:
         type=int,
         default=3,
         help="Default LLM score cutoff for review subset mode.",
+    )
+    parser.add_argument(
+        "--review_output_csv",
+        type=str,
+        default="feat_cache_vis/examiner_confirmed_true_outliers.csv",
+        help="Output CSV path for confirmed true outliers.",
+    )
+    parser.add_argument(
+        "--reviewer_id",
+        type=str,
+        default="unknown",
+        help="Reviewer identifier written to confirmed outlier CSV.",
     )
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Dash host.")
     parser.add_argument("--port", type=int, default=8050, help="Dash port.")
@@ -427,12 +481,162 @@ def load_rationale_map(csv_path: Path) -> dict[str, dict[str, object]]:
     return mapping
 
 
+def _value_or_empty(value):
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    return value
+
+
+def _bool_or_empty(value):
+    parsed = _bool_or_none(value)
+    if parsed is None:
+        return ""
+    return bool(parsed)
+
+
+def load_prediction_map(mis_path: Path | None, correct_path: Path | None) -> dict[str, dict[str, object]]:
+    pred_map: dict[str, dict[str, object]] = {}
+    conflict_count = 0
+    duplicate_count = 0
+
+    for path in [mis_path, correct_path]:
+        if path is None or not path.is_file():
+            continue
+        df = pd.read_csv(path)
+        required = {"file_name", "predicted_label", "predicted_word_label"}
+        missing = required - set(df.columns)
+        if missing:
+            print(f"[warn] {path.name} missing columns: {sorted(missing)}; skipping for predictions.")
+            continue
+        missing_optional = sorted(set(PREDICTION_COLUMNS) - set(df.columns))
+        if missing_optional:
+            print(f"[warn] {path.name} missing optional prediction columns: {missing_optional}.")
+
+        for row in df.itertuples(index=False):
+            fname = getattr(row, "file_name", None)
+            if not isinstance(fname, str):
+                continue
+            entry = {col: _value_or_empty(getattr(row, col, "")) for col in PREDICTION_COLUMNS}
+            if fname in pred_map:
+                duplicate_count += 1
+                current = pred_map[fname]
+                if any(str(current.get(col, "")) != str(entry.get(col, "")) for col in PREDICTION_COLUMNS):
+                    conflict_count += 1
+                continue
+            pred_map[fname] = entry
+
+    if duplicate_count:
+        print(f"[warn] prediction inputs have {duplicate_count} duplicate file_name rows; keeping first.")
+    if conflict_count:
+        print(f"[warn] prediction inputs have {conflict_count} conflicting duplicate predictions; kept first.")
+    return pred_map
+
+
+def build_file_row_lookup(df: pd.DataFrame) -> dict[str, dict[str, object]]:
+    if "file_name" not in df.columns:
+        return {}
+    dup_count = int(df["file_name"].duplicated().sum())
+    if dup_count:
+        print(f"[warn] merged dataframe has {dup_count} duplicate file_name rows; keeping first.")
+    dedup = df.drop_duplicates(subset=["file_name"], keep="first")
+    return dedup.set_index("file_name").to_dict(orient="index")
+
+
+def build_export_row(
+    file_name: str,
+    row_lookup: dict[str, dict[str, object]],
+    prediction_map: dict[str, dict[str, object]],
+    reviewer_id: str,
+) -> dict[str, object]:
+    row = row_lookup.get(file_name, {})
+    pred = prediction_map.get(file_name, {})
+
+    export_row = {
+        "file_name": file_name,
+        "ground_truth_num_label": _value_or_empty(row.get("ground_truth_num_label", "")),
+        "ground_truth_word_label": _value_or_empty(row.get("ground_truth_word_label", "")),
+        "ground_truth_L2_num_label": _value_or_empty(row.get("ground_truth_L2_num_label", "")),
+        "predicted_label": _value_or_empty(pred.get("predicted_label", "")),
+        "predicted_word_label": _value_or_empty(pred.get("predicted_word_label", "")),
+        "dataset": _value_or_empty(pred.get("dataset", "")),
+        "top3_label_1": _value_or_empty(pred.get("top3_label_1", "")),
+        "top3_prob_1": _value_or_empty(pred.get("top3_prob_1", "")),
+        "top3_label_2": _value_or_empty(pred.get("top3_label_2", "")),
+        "top3_prob_2": _value_or_empty(pred.get("top3_prob_2", "")),
+        "top3_label_3": _value_or_empty(pred.get("top3_label_3", "")),
+        "top3_prob_3": _value_or_empty(pred.get("top3_prob_3", "")),
+        "split": _value_or_empty(pred.get("split", "")),
+        "image_path": _value_or_empty(pred.get("image_path", "")),
+        "rationale": _value_or_empty(pred.get("rationale", "")),
+        "centroid_sim_to_centroid": _value_or_empty(row.get("centroid_5__sim_to_centroid", "")),
+        "centroid_pct_rank_in_class": _value_or_empty(row.get("centroid_5__pct_rank_in_class", "")),
+        "centroid_is_bottom_5pct": _bool_or_empty(row.get("centroid_5__flag")),
+        "mp10_sim_to_centroid": _value_or_empty(row.get("mp_10__sim_to_centroid", "")),
+        "mp10_pct_rank_in_class": _value_or_empty(row.get("mp_10__pct_rank_in_class", "")),
+        "mp10_is_bottom_10pct": _bool_or_empty(row.get("mp_10__flag")),
+        "mp10_margin_to_other_class": _value_or_empty(row.get(MP10_MARGIN_COLUMN, "")),
+        "reviewer_id": reviewer_id or "unknown",
+        "reviewed_at_utc": pd.Timestamp.utcnow().isoformat(),
+    }
+    return export_row
+
+
+def load_existing_confirmed_rows(output_path: Path) -> dict[str, dict[str, object]]:
+    if not output_path.is_file():
+        return {}
+
+    try:
+        df = pd.read_csv(output_path)
+    except Exception as exc:
+        print(f"[warn] failed to read existing review output CSV '{output_path}': {exc}")
+        return {}
+
+    if "file_name" not in df.columns:
+        print(f"[warn] existing review output CSV '{output_path}' missing file_name; ignoring preload.")
+        return {}
+
+    store: dict[str, dict[str, object]] = {}
+    bad_rows = 0
+    for row in df.to_dict(orient="records"):
+        fname = row.get("file_name")
+        if not isinstance(fname, str) or not fname:
+            bad_rows += 1
+            continue
+        normalized = {}
+        for col in EXPORT_COLUMNS:
+            normalized[col] = _value_or_empty(row.get(col, ""))
+        store[fname] = normalized
+
+    if bad_rows:
+        print(f"[warn] existing review output CSV '{output_path}' has {bad_rows} invalid rows; ignored.")
+    return store
+
+
+def save_confirmed_rows(store_dict: dict[str, dict[str, object]], output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    rows = list(store_dict.values())
+    df = pd.DataFrame(rows, columns=EXPORT_COLUMNS)
+    temp_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    df.to_csv(temp_path, index=False)
+    temp_path.replace(output_path)
+
+
 def load_score_source(csv_path: Path, source_key: str, bottom_col: str) -> pd.DataFrame:
     flag_col, sim_col, pct_col = _score_columns_for_key(source_key)
     output_columns = ["file_name", flag_col, sim_col, pct_col]
+    include_margin = source_key == "mp_10"
+    if include_margin:
+        output_columns.append(MP10_MARGIN_COLUMN)
     df = pd.read_csv(csv_path)
 
     required = {"file_name", "sim_to_centroid", "pct_rank_in_class", bottom_col}
+    if include_margin:
+        required.add("margin_to_other_class")
     missing = required - set(df.columns)
     if missing:
         print(f"[warn] {csv_path.name} missing columns: {sorted(missing)}; skipping.")
@@ -457,6 +661,8 @@ def load_score_source(csv_path: Path, source_key: str, bottom_col: str) -> pd.Da
             pct_col: pd.to_numeric(df["pct_rank_in_class"], errors="coerce"),
         }
     )
+    if include_margin:
+        out[MP10_MARGIN_COLUMN] = pd.to_numeric(df["margin_to_other_class"], errors="coerce")
     return out
 
 
@@ -601,6 +807,7 @@ def main() -> None:
         correct_map = load_rationale_map(correct_path)
     elif args.correct_csv:
         print(f"[warn] correct_csv '{correct_path}' not found; skipping.")
+    prediction_map = load_prediction_map(mis_path, correct_path)
 
     llm_score_sources = []
     if mis_path and mis_path.is_file():
@@ -629,6 +836,8 @@ def main() -> None:
         df["img_url"] = ""
 
     score_cols = score_custom_columns()
+    if MP10_MARGIN_COLUMN not in df.columns:
+        df[MP10_MARGIN_COLUMN] = np.nan
     custom_cols = ["img_url", "file_name", "ground_truth_word_label", "llm_score"] + score_cols
     for col in score_cols:
         if col not in df.columns:
@@ -648,6 +857,14 @@ def main() -> None:
     initial_llm_cutoff = _resolve_llm_cutoff(args.default_llm_cutoff)
     initial_active = active_source_keys(DEFAULT_METHODS, THRESHOLD_STEPS[-1])
     initial_fig = build_scatter_figure(df, color_col, hover_cols, custom_cols, initial_active)
+    row_lookup = build_file_row_lookup(df)
+
+    review_output_path = Path(args.review_output_csv)
+    initial_confirmed_store = load_existing_confirmed_rows(review_output_path)
+    initial_status_store = {
+        "kind": "info",
+        "message": f"Loaded {len(initial_confirmed_store)} confirmed sample(s).",
+    }
 
     app = Dash(__name__)
     if image_dir:
@@ -658,6 +875,9 @@ def main() -> None:
 
     app.layout = html.Div(
         [
+            dcc.Store(id="selected-file-store", data={}),
+            dcc.Store(id="confirmed-outliers-store", data=initial_confirmed_store),
+            dcc.Store(id="review-status-store", data=initial_status_store),
             html.Div(
                 [
                     html.Div(
@@ -718,6 +938,19 @@ def main() -> None:
                         id="img-view",
                         style={"width": "100%", "height": "auto", "border": "1px solid #eee"},
                     ),
+                    html.Div(
+                        [
+                            html.Button("Mark True Outlier", id="mark-true-outlier-btn", n_clicks=0),
+                            html.Button(
+                                "Unmark",
+                                id="unmark-true-outlier-btn",
+                                n_clicks=0,
+                                style={"marginLeft": "8px"},
+                            ),
+                        ],
+                        style={"marginTop": "10px"},
+                    ),
+                    html.Div(id="review-status-text", style={"marginTop": "8px", "fontSize": "12px"}),
                     html.Div(id="img-caption", style={"marginTop": "8px", "fontSize": "12px", "color": "#555"}),
                 ],
                 style={"flex": "1", "borderLeft": "1px solid #ddd", "padding": "12px", "overflowY": "auto"},
@@ -745,27 +978,107 @@ def main() -> None:
         return build_scatter_figure(df_plot, color_col, hover_cols, custom_cols, active_keys)
 
     @app.callback(
+        Output("selected-file-store", "data"),
+        Input("embed-graph", "clickData"),
+        State("selected-file-store", "data"),
+    )
+    def _update_selected_file(click_data, current_selected):
+        if not click_data or "points" not in click_data or not click_data["points"]:
+            return no_update
+        custom = click_data["points"][0].get("customdata", [])
+        fname = _custom_get(custom, "file_name", "")
+        if not fname:
+            return no_update
+        if current_selected and current_selected.get("file_name") == fname:
+            return no_update
+        return {"file_name": fname}
+
+    @app.callback(
+        Output("confirmed-outliers-store", "data"),
+        Output("review-status-store", "data"),
+        Input("mark-true-outlier-btn", "n_clicks"),
+        Input("unmark-true-outlier-btn", "n_clicks"),
+        State("selected-file-store", "data"),
+        State("confirmed-outliers-store", "data"),
+    )
+    def _update_confirmed_store(mark_clicks, unmark_clicks, selected_file_data, confirmed_store_data):
+        trigger = ctx.triggered_id
+        if trigger not in {"mark-true-outlier-btn", "unmark-true-outlier-btn"}:
+            return no_update, no_update
+
+        selected_file = (selected_file_data or {}).get("file_name", "")
+        if not selected_file:
+            return no_update, {"kind": "error", "message": "No selected sample. Click a point first."}
+
+        current_store = dict(confirmed_store_data or {})
+        action_message = ""
+
+        if trigger == "mark-true-outlier-btn":
+            export_row = build_export_row(selected_file, row_lookup, prediction_map, args.reviewer_id)
+            current_store[selected_file] = export_row
+            action_message = f"Marked {selected_file} as true outlier."
+        else:
+            if selected_file in current_store:
+                del current_store[selected_file]
+                action_message = f"Unmarked {selected_file}."
+            else:
+                action_message = f"{selected_file} was not marked."
+
+        try:
+            save_confirmed_rows(current_store, review_output_path)
+        except Exception as exc:
+            return no_update, {"kind": "error", "message": f"Failed to save CSV: {exc}"}
+
+        return current_store, {
+            "kind": "success",
+            "message": f"{action_message} Saved {len(current_store)} confirmed sample(s).",
+        }
+
+    @app.callback(
+        Output("review-status-text", "children"),
+        Input("review-status-store", "data"),
+    )
+    def _render_review_status(status_data):
+        status = status_data or {}
+        kind = str(status.get("kind", "info")).lower()
+        message = str(status.get("message", ""))
+        prefix = {"success": "[ok]", "error": "[error]", "info": "[info]"}.get(kind, "[info]")
+        if not message:
+            return ""
+        return f"{prefix} {message}"
+
+    @app.callback(
         Output("img-view", "src"),
         Output("img-caption", "children"),
-        Input("embed-graph", "clickData"),
+        Input("selected-file-store", "data"),
         Input("outlier-methods", "value"),
         Input("outlier-threshold", "value"),
         Input("review-subset-only", "value"),
         Input("review-llm-cutoff", "value"),
+        Input("confirmed-outliers-store", "data"),
+        Input("review-status-store", "data"),
     )
-    def _on_click(click_data, selected_methods, threshold_value, review_subset_values, llm_cutoff_value):
-        if not click_data or "points" not in click_data or not click_data["points"]:
+    def _render_panel(
+        selected_file_data,
+        selected_methods,
+        threshold_value,
+        review_subset_values,
+        llm_cutoff_value,
+        confirmed_store_data,
+        review_status_data,
+    ):
+        selected_file = (selected_file_data or {}).get("file_name", "")
+        if not selected_file:
             return "", "Click a point to load image."
 
-        custom = click_data["points"][0].get("customdata", [])
-        img_url = _custom_get(custom, "img_url", "")
-        fname = _custom_get(custom, "file_name", "")
-        gt_word = _custom_get(custom, "ground_truth_word_label", "")
-        llm_score = _custom_get(custom, "llm_score", None)
+        row = row_lookup.get(selected_file, {})
+        img_url = _value_or_empty(row.get("img_url", ""))
+        gt_word = _value_or_empty(row.get("ground_truth_word_label", ""))
+        llm_score = row.get("llm_score", None)
         llm_cutoff = _resolve_llm_cutoff(llm_cutoff_value)
 
-        mis_entry = mis_map.get(fname)
-        correct_entry = correct_map.get(fname)
+        mis_entry = mis_map.get(selected_file)
+        correct_entry = correct_map.get(selected_file)
         if mis_entry and correct_entry:
             prediction = "ambiguous (found in mis + correct)"
             entry = mis_entry
@@ -799,7 +1112,7 @@ def main() -> None:
         active_labels: list[str] = []
         for key in active_keys:
             flag_col, _, _ = _score_columns_for_key(key)
-            if _bool_or_none(_custom_get(custom, flag_col)) is True:
+            if _bool_or_none(row.get(flag_col)) is True:
                 active_labels.append(SCORE_SPEC_BY_KEY[key]["label"])
 
         active_flag_summary = f"Active outlier flags: {len(active_labels)} / {len(active_keys)}"
@@ -807,8 +1120,8 @@ def main() -> None:
 
         centroid_flag_col = _score_columns_for_key("centroid_5")[0]
         mp10_flag_col = _score_columns_for_key("mp_10")[0]
-        rule_centroid = _bool_or_none(_custom_get(custom, centroid_flag_col)) is True
-        rule_mp10 = _bool_or_none(_custom_get(custom, mp10_flag_col)) is True
+        rule_centroid = _bool_or_none(row.get(centroid_flag_col)) is True
+        rule_mp10 = _bool_or_none(row.get(mp10_flag_col)) is True
         rule_llm = False
         try:
             if llm_score is not None and not pd.isna(llm_score):
@@ -826,11 +1139,16 @@ def main() -> None:
         review_rules_line = "Review rules active: " + (", ".join(review_rule_labels) if review_rule_labels else "(none)")
         review_mode_line = "Review subset only: " + ("on" if is_review_subset_enabled(review_subset_values) else "off")
 
+        confirmed_store = dict(confirmed_store_data or {})
+        confirmed_count = len(confirmed_store)
+        is_confirmed = selected_file in confirmed_store
+        review_status_message = str((review_status_data or {}).get("message", ""))
+
         table_rows = []
         td_style = {"borderBottom": "1px solid #e6e6e6", "padding": "4px 6px", "verticalAlign": "top"}
         for spec in SCORE_SOURCE_SPECS:
             flag_col, sim_col, pct_col = _score_columns_for_key(spec["key"])
-            flag_value = _custom_get(custom, flag_col)
+            flag_value = row.get(flag_col)
             row_style = {"backgroundColor": "#fff8e6"} if _bool_or_none(flag_value) is True else {}
             table_rows.append(
                 html.Tr(
@@ -838,8 +1156,8 @@ def main() -> None:
                         html.Td(spec["label"], style=td_style),
                         html.Td("Yes" if spec.get("used_in_review_rule") else "No", style=td_style),
                         html.Td(_fmt_bool(flag_value), style=td_style),
-                        html.Td(_fmt_num(_custom_get(custom, sim_col), digits=6), style=td_style),
-                        html.Td(_fmt_pct_rank(_custom_get(custom, pct_col)), style=td_style),
+                        html.Td(_fmt_num(row.get(sim_col), digits=6), style=td_style),
+                        html.Td(_fmt_pct_rank(row.get(pct_col)), style=td_style),
                     ],
                     style=row_style,
                 )
@@ -864,7 +1182,7 @@ def main() -> None:
         )
 
         caption = [
-            html.Div(f"file_name: {fname}" if fname else "file_name: (missing)"),
+            html.Div(f"file_name: {selected_file}" if selected_file else "file_name: (missing)"),
             html.Div(
                 f"ground_truth_word_label: {gt_word}"
                 if gt_word != ""
@@ -879,6 +1197,9 @@ def main() -> None:
             html.Div(review_rules_line),
             html.Div(f"Current LLM cutoff: {llm_cutoff}"),
             html.Div(review_mode_line),
+            html.Div(f"Confirmed true outlier: {'Yes' if is_confirmed else 'No'}"),
+            html.Div(f"Current confirmed count: {confirmed_count}"),
+            html.Div(f"Last save status: {review_status_message or '(none)'}"),
             html.Hr(),
             table,
         ]
